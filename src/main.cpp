@@ -1,36 +1,34 @@
-// main.cpp (FRDM-KL25Z, 3x TCRT5000 -> 3x LM311 comparators, L298N)
+// main.cpp (FRDM-KL25Z, 3x TCRT5000 -> 3x LM311 comparators, L298N) + RGB debug LED
 #include "mbed.h"
 #include "pinassignments.hpp"
 #include "rovercontrol.hpp"
 
 // ===================== User-config =====================
-// LM311 is open-collector. Common setup is pull-up + comparator pulls LOW when active.
-// Set this based on what you observe.
-static constexpr bool LINE_ACTIVE_LOW = true;
+static constexpr bool LINE_ACTIVE_LOW = false; // black = HIGH
 
-// Control loop timing
 static constexpr chrono::milliseconds DT{5}; // 200 Hz
 
-// Filtering (majority over last N samples). N must be <= 8 here.
-static constexpr int FILTER_N = 7; // 7-sample window
+static constexpr int FILTER_N = 7;
 static constexpr int FILTER_MAJ = (FILTER_N / 2) + 1;
 
-// Speeds (0..1 PWM duty). Tune these on the floor.
-static constexpr float V_BASE = 0.55f;
+static constexpr float V_BASE = 0.45f;
 static constexpr float V_LOST = 0.35f;
-static constexpr float D_SOFT = 0.18f;
-static constexpr float D_HARD = 0.32f;
 
-// Deadband compensation for L298N (many setups will not move below ~0.2 to 0.35).
+static constexpr float D_SOFT = 0.18f;
+static constexpr float D_HARD = 0.35f;
+static constexpr float D_LOST = 0.45f;
+
 static constexpr float DUTY_MIN_MOVE = 0.28f;
 
-// LOST detection (avoid spurious 000 patterns)
-static constexpr int LOST_COUNT_TRIP = 6; // 6*DT = 30ms
+static constexpr int LOST_COUNT_TRIP = 6; // 30ms
 
-// Clamp helper
+// Tank/pivot strength for hard turns and LOST
+static constexpr float TANK_TURN = 0.90f;
+
+// Clamp helpers
 static inline float clamp01(float x) { return (x < 0.0f) ? 0.0f : (x > 1.0f) ? 1.0f : x; }
+static inline float clamp11(float x) { return (x < -1.0f) ? -1.0f : (x > 1.0f) ? 1.0f : x; }
 
-// Apply deadband to a signed motor command (keeps sign, raises magnitude if nonzero)
 static float apply_deadband(float cmd) {
     if (cmd == 0.0f) return 0.0f;
     float s = (cmd > 0.0f) ? 1.0f : -1.0f;
@@ -39,7 +37,6 @@ static float apply_deadband(float cmd) {
     return s * clamp01(mag);
 }
 
-// Popcount for up to 8 bits
 static inline int popcount8(uint8_t x) {
     int c = 0;
     for (int i = 0; i < 8; ++i) c += (x >> i) & 1;
@@ -58,97 +55,115 @@ struct FilterBit {
 
 enum class LastDir : uint8_t { LEFT, RIGHT };
 
+// FRDM-KL25Z on-board RGB LED (active-low)
+DigitalOut led_r(LED1);
+DigitalOut led_g(LED2);
+DigitalOut led_b(LED3);
+
+static inline void led_off() { led_r = 1; led_g = 1; led_b = 1; }
+static inline void set_rgb(bool r_on, bool g_on, bool b_on) {
+    led_r = r_on ? 0 : 1;
+    led_g = g_on ? 0 : 1;
+    led_b = b_on ? 0 : 1;
+}
+
 int main() {
-    // Ensure pull-ups for LM311 open-collector outputs.
-    // If you already have external pull-ups, internal pull-ups usually still work.
     Left_TCRT.mode(PullUp);
     Centre_TCRT.mode(PullUp);
     Right_TCRT.mode(PullUp);
 
-    motors_init(0.001f); // 1 kHz PWM period (as you used)
+    motors_init(0.001f);
 
     FilterBit fL, fC, fR;
 
     LastDir last_dir = LastDir::LEFT;
     int lost_count = 0;
 
+    led_off();
+
     while (true) {
-        // Raw reads
         bool rawL = Left_TCRT.read();
         bool rawC = Centre_TCRT.read();
         bool rawR = Right_TCRT.read();
 
-        // Convert to "line detected" boolean with chosen polarity
-        auto to_line = [](bool raw) {
-            return LINE_ACTIVE_LOW ? (!raw) : raw;
-        };
+        auto to_line = [](bool raw) { return LINE_ACTIVE_LOW ? (!raw) : raw; };
 
         bool lineL = fL.update(to_line(rawL));
         bool lineC = fC.update(to_line(rawC));
         bool lineR = fR.update(to_line(rawR));
 
-        // Pattern bits: L C R
+        // swap left/right after filtering
+        bool tmp = lineL;
+        lineL = lineR;
+        lineR = tmp;
+
         const uint8_t pat = (uint8_t)((lineL ? 0b100 : 0) | (lineC ? 0b010 : 0) | (lineR ? 0b001 : 0));
+
+        switch (pat) {
+            case 0b010: set_rgb(false, true,  false); break; // green
+            case 0b110: set_rgb(true,  true,  false); break; // yellow
+            case 0b011: set_rgb(false, true,  true ); break; // cyan
+            case 0b100: set_rgb(true,  false, false); break; // red
+            case 0b001: set_rgb(false, false, true ); break; // blue
+            case 0b000: set_rgb(true,  false, true ); break; // magenta
+            case 0b111: set_rgb(true,  true,  true ); break; // white
+            case 0b101: set_rgb(true,  true,  true ); break;
+            default:    led_off(); break;
+        }
 
         float left_cmd = 0.0f;
         float right_cmd = 0.0f;
 
-        // LOST handling
-        if (pat == 0b000) {
-            lost_count++;
-        } else {
-            lost_count = 0;
-        }
+        if (pat == 0b000) lost_count++;
+        else lost_count = 0;
 
+        // LOST: tank pivot in last known direction
         if (lost_count >= LOST_COUNT_TRIP) {
-            // LOST: arc-turn toward last known direction
             if (last_dir == LastDir::LEFT) {
-                left_cmd  = V_LOST - D_HARD;
-                right_cmd = V_LOST + D_HARD;
+                left_cmd  = -TANK_TURN;
+                right_cmd = +TANK_TURN;
             } else {
-                left_cmd  = V_LOST + D_HARD;
-                right_cmd = V_LOST - D_HARD;
+                left_cmd  = +TANK_TURN;
+                right_cmd = -TANK_TURN;
             }
         } else {
-            // FOLLOW: pattern map with soft/hard turns
             switch (pat) {
-                case 0b010: // centered
+                case 0b010:
                     left_cmd = V_BASE;
                     right_cmd = V_BASE;
                     break;
 
-                case 0b110: // left + center
+                case 0b110:
                     left_cmd  = V_BASE - D_SOFT;
                     right_cmd = V_BASE + D_SOFT;
                     last_dir = LastDir::LEFT;
                     break;
 
-                case 0b011: // center + right
+                case 0b011:
                     left_cmd  = V_BASE + D_SOFT;
                     right_cmd = V_BASE - D_SOFT;
                     last_dir = LastDir::RIGHT;
                     break;
 
-                case 0b100: // left only
-                    left_cmd  = V_BASE - D_HARD;
-                    right_cmd = V_BASE + D_HARD;
+                // Hard turns: tank pivot
+                case 0b100: // hard left
+                    left_cmd  = -TANK_TURN;
+                    right_cmd = +TANK_TURN;
                     last_dir = LastDir::LEFT;
                     break;
 
-                case 0b001: // right only
-                    left_cmd  = V_BASE + D_HARD;
-                    right_cmd = V_BASE - D_HARD;
+                case 0b001: // hard right
+                    left_cmd  = +TANK_TURN;
+                    right_cmd = -TANK_TURN;
                     last_dir = LastDir::RIGHT;
                     break;
 
-                case 0b111: // wide line / intersection
-                    // Policy: go straight briefly (keep v), do not update last_dir
+                case 0b111:
                     left_cmd = V_BASE;
                     right_cmd = V_BASE;
                     break;
 
-                case 0b101: // both sides, no center (could happen on edges or wide line)
-                    // Policy: keep last_dir bias (prevents indecision)
+                case 0b101:
                     if (last_dir == LastDir::LEFT) {
                         left_cmd  = V_BASE - D_SOFT;
                         right_cmd = V_BASE + D_SOFT;
@@ -165,14 +180,12 @@ int main() {
             }
         }
 
-        // Apply deadband compensation and clamp
         left_cmd = apply_deadband(left_cmd);
         right_cmd = apply_deadband(right_cmd);
 
-        // Both forward only in this controller; keep commands non-negative.
-        // If you want pivot turns, allow negative here and adjust mapping.
-        left_cmd = clamp01(left_cmd);
-        right_cmd = clamp01(right_cmd);
+        // Signed clamp (allows reverse for tank steering)
+        left_cmd = clamp11(left_cmd);
+        right_cmd = clamp11(right_cmd);
 
         motor_set(left_cmd, right_cmd);
 
