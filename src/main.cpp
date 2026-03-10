@@ -4,8 +4,7 @@
 // - TCS3472 on I2C (D14 SDA, D15 SCL)
 // - If RED detected: stop
 // - While stopped, if GREEN detected: resume
-// Added (new):
-// - Before ANY mode change (straight <-> turn <-> lost), dynamically brake BOTH motors for 15 ms.
+// - Before ANY mode change (straight <-> turn <-> lost), dynamically brake BOTH motors
 
 #include "mbed.h"
 #include "pinassignments.hpp"
@@ -35,8 +34,8 @@ static constexpr int HITS_TO_STOP = 3; // consecutive RED samples required
 static constexpr int HITS_TO_GO   = 3; // consecutive GREEN samples required
 
 // ===================== Transition brake config =====================
-static constexpr chrono::milliseconds BRAKE_TIME{50}; // brake before each mode change
-static constexpr float BRAKE_STRENGTH = 1.0f;        // 0..1 (raise if braking feels weak)
+static constexpr chrono::milliseconds BRAKE_TIME{50};
+static constexpr float BRAKE_STRENGTH = 1.0f;
 
 // ===================== Helpers =====================
 static inline float clamp01(float x) { return (x < 0.0f) ? 0.0f : (x > 1.0f) ? 1.0f : x; }
@@ -124,12 +123,11 @@ int main() {
     FilterBit fL, fC, fR;
     LastDir last_dir = LastDir::LEFT;
 
-    Mode active_mode = Mode::STRAIGHT;   // currently applied mode
-    Mode desired_mode = Mode::STRAIGHT;  // computed mode for this tick
+    Mode active_mode = Mode::STRAIGHT;
+    Mode desired_mode = Mode::STRAIGHT;
 
     int lost_count = 0;
 
-    // Transition braking state
     bool braking = false;
     Timer brake_timer;
     brake_timer.start();
@@ -150,7 +148,7 @@ int main() {
                     run_state = RunState::STOPPED;
                     green_hits = 0;
                 }
-            } else { // STOPPED
+            } else {
                 if (green_hits >= HITS_TO_GO) {
                     run_state = RunState::RUNNING;
                     red_hits = 0;
@@ -160,8 +158,8 @@ int main() {
 
         // ---------- STOPPED overrides everything ----------
         if (run_state == RunState::STOPPED) {
-            motor_brake(BRAKE_STRENGTH);            // if you prefer braking while stopped, use motor_brake(BRAKE_STRENGTH);
-            set_rgb(true, true, false);    // yellow = stopped
+            motor_brake(BRAKE_STRENGTH);
+            set_rgb(true, true, false); // yellow = stopped
             ThisThread::sleep_for(DT);
             continue;
         }
@@ -180,18 +178,36 @@ int main() {
         if (!lineL && !lineC && !lineR) lost_count++;
         else lost_count = 0;
 
-        // ---------- Desired mode (same logic as your original, but writing desired_mode) ----------
+        // ---------- Desired mode ----------
         if (lost_count >= LOST_COUNT_TRIP) {
             desired_mode = Mode::LOST;
-        } else if (lineC) {
+        }
+        else if (lineL && lineC && !lineR) {
+            desired_mode = Mode::TURN_LEFT;   // 110
+            last_dir = LastDir::LEFT;
+        }
+        else if (!lineL && lineC && lineR) {
+            desired_mode = Mode::TURN_RIGHT;  // 011
+            last_dir = LastDir::RIGHT;
+        }
+        else if (lineC) {
             desired_mode = Mode::STRAIGHT;
-        } else {
+        }
+        else {
             if (active_mode != Mode::TURN_LEFT && active_mode != Mode::TURN_RIGHT) {
-                if (lineL) { desired_mode = Mode::TURN_LEFT;  last_dir = LastDir::LEFT; }
-                else if (lineR) { desired_mode = Mode::TURN_RIGHT; last_dir = LastDir::RIGHT; }
-                else desired_mode = active_mode; // hold
+                if (lineL) {
+                    desired_mode = Mode::TURN_LEFT;
+                    last_dir = LastDir::LEFT;
+                }
+                else if (lineR) {
+                    desired_mode = Mode::TURN_RIGHT;
+                    last_dir = LastDir::RIGHT;
+                }
+                else {
+                    desired_mode = active_mode; // hold
+                }
             } else {
-                // stay locked in a turn until center sees line
+                // stay locked in a turn until center sees line again
                 desired_mode = active_mode;
             }
         }
@@ -203,19 +219,18 @@ int main() {
         }
 
         if (braking) {
-            motor_brake(BRAKE_STRENGTH);   // dynamic brake BOTH sides
-            set_rgb(true, true, true);     // white = braking
+            motor_brake(BRAKE_STRENGTH);
+            set_rgb(true, true, true); // white = braking
 
             if (brake_timer.elapsed_time() >= BRAKE_TIME) {
                 braking = false;
-                active_mode = desired_mode; // commit after braking
+                active_mode = desired_mode;
             }
 
             ThisThread::sleep_for(DT);
             continue;
         }
 
-        // Normal operation: use active_mode
         // ---------- LED indication ----------
         switch (active_mode) {
             case Mode::STRAIGHT:   set_rgb(false, true,  false); break;
@@ -239,8 +254,13 @@ int main() {
             left_cmd = +TANK_TURN;
             right_cmd = -TANK_TURN;
         } else { // LOST
-            if (last_dir == LastDir::LEFT) { left_cmd = -LOST_TURN; right_cmd = +LOST_TURN; }
-            else { left_cmd = +LOST_TURN; right_cmd = -LOST_TURN; }
+            if (last_dir == LastDir::LEFT) {
+                left_cmd = -LOST_TURN;
+                right_cmd = +LOST_TURN;
+            } else {
+                left_cmd = +LOST_TURN;
+                right_cmd = -LOST_TURN;
+            }
         }
 
         left_cmd  = clamp11(apply_deadband(left_cmd));
